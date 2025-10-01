@@ -3,7 +3,7 @@ name: 'AppMod Terraform'
 on:
   push:
     branches:
-      - feature/HCIDM-351-terraform-linux-ec2
+      - test
     paths:
       - 'environments/dev/aws/appmod/**'
       - '.github/workflows/appmod_terraform.yml'
