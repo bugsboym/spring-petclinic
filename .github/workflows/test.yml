@@ -1,0 +1,238 @@
+name: 'AppMod Terraform'
+
+on:
+  push:
+    branches:
+      - feature/HCIDM-351-terraform-linux-ec2
+    paths:
+      - 'environments/dev/aws/appmod/**'
+      - '.github/workflows/appmod_terraform.yml'
+  pull_request:
+    branches:
+      - feature/HCIDM-351-terraform-linux-ec2
+    paths:
+      - 'environments/dev/aws/appmod/**'
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Terraform action to perform'
+        type: choice
+        required: true
+        default: 'plan'
+        options:
+          - plan
+          - apply
+          - destroy
+      destroy_confirmation:
+        description: 'Type "DESTROY" to confirm infrastructure destruction (required for destroy action)'
+        type: string
+        required: false
+      destroy_reason:
+        description: 'Reason for destroying the infrastructure (required for destroy action)'
+        type: string
+        required: false
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  TF_VERSION: '1.8.0'
+  AWS_REGION: 'us-west-2'
+  AWS_ROLE_TO_ASSUME: 'arn:aws:iam::120569633811:role/GitHubAction-AdministrativeAccess'
+
+jobs:
+  terraform:
+    name: 'AppMod Terraform'
+    runs-on: [self-hosted, linux, x64, philips-code-hub, ubuntu-latest]
+    
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Determine Action
+        id: action
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "action=${{ inputs.action }}" >> $GITHUB_OUTPUT
+            echo "🎯 Manual action: ${{ inputs.action }}"
+          else
+            COMMIT_MSG="${{ github.event.head_commit.message }}"
+            if [[ "$COMMIT_MSG" == *"[DESTROY]"* ]]; then
+              echo "action=destroy" >> $GITHUB_OUTPUT
+              echo "🗑️ DESTROY action detected in commit message"
+            elif [ "${{ github.event_name }}" == "pull_request" ]; then
+              echo "action=plan" >> $GITHUB_OUTPUT
+              echo "📋 Plan action (PR)"
+            else
+              echo "action=plan-apply" >> $GITHUB_OUTPUT
+              echo "🚀 Plan + Apply action (push)"
+            fi
+          fi
+
+      - name: Validate Destroy Inputs
+        if: steps.action.outputs.action == 'destroy'
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            if [ "${{ inputs.destroy_confirmation }}" != "DESTROY" ]; then
+              echo "❌ ERROR: You must type 'DESTROY' exactly to confirm infrastructure destruction"
+              echo "You typed: '${{ inputs.destroy_confirmation }}'"
+              exit 1
+            fi
+            if [ -z "${{ inputs.destroy_reason }}" ]; then
+              echo "❌ ERROR: You must provide a reason for destroying the infrastructure"
+              exit 1
+            fi
+            echo "✅ Destroy validation passed"
+            echo "Reason: ${{ inputs.destroy_reason }}"
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update git config with Private Token
+        uses: philips-labs/terraform-private-modules-action@v1.2
+        with:
+          org: philips-internal
+          token: "${{ secrets.FMP_GH_TOKEN }}"
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Clean old plan files
+        working-directory: ./environments/dev/aws/appmod
+        run: |
+          rm -f tfplan
+          rm -f destroy-plan
+          rm -f .terraform.lock.hcl
+
+      - name: Terraform Init
+        id: init
+        working-directory: ./environments/dev/aws/appmod
+        run: terraform init -reconfigure
+
+      - name: Terraform Format
+        id: fmt
+        working-directory: ./environments/dev/aws/appmod
+        run: terraform fmt -check
+        continue-on-error: true
+
+      - name: Terraform Validate
+        id: validate
+        working-directory: ./environments/dev/aws/appmod
+        run: terraform validate
+
+      - name: Terraform Plan
+        id: plan
+        if: steps.action.outputs.action == 'plan-apply' || steps.action.outputs.action == 'plan'
+        working-directory: ./environments/dev/aws/appmod
+        run: terraform plan -var-file="appmod.tfvars" -out=tfplan
+        continue-on-error: true
+
+      - name: Terraform Plan Destroy
+        id: plan_destroy
+        if: steps.action.outputs.action == 'destroy'
+        working-directory: ./environments/dev/aws/appmod
+        run: |
+          echo "🔍 Planning infrastructure destruction..."
+          terraform plan -destroy -var-file="appmod.tfvars" -out=destroy-plan
+          echo "📋 Destroy plan created successfully"
+        continue-on-error: true
+
+      - name: Terraform Apply
+        if: (steps.action.outputs.action == 'plan-apply' && steps.plan.outcome == 'success' && github.event_name == 'push') || (steps.action.outputs.action == 'apply' && github.event_name == 'workflow_dispatch')
+        working-directory: ./environments/dev/aws/appmod
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "🚀 Manual apply requested..."
+            terraform plan -var-file="appmod.tfvars" -out=tfplan
+            terraform apply tfplan
+          else
+            echo "🚀 Applying Terraform changes automatically..."
+            terraform apply tfplan
+          fi
+
+      - name: Terraform Destroy
+        if: steps.action.outputs.action == 'destroy' && (steps.plan_destroy.outcome == 'success' || github.event_name == 'push')
+        working-directory: ./environments/dev/aws/appmod
+        run: |
+          echo "🚨 Starting infrastructure destruction..."
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "Trigger: Manual workflow dispatch"
+            echo "Requested by: ${{ github.actor }}"
+            echo "Reason: ${{ inputs.destroy_reason }}"
+            terraform apply destroy-plan
+          else
+            echo "Trigger: Commit message [DESTROY]"
+            echo "Commit message: ${{ github.event.head_commit.message }}"
+            terraform destroy -var-file="appmod.tfvars" -auto-approve
+          fi
+          echo "✅ Infrastructure destruction completed"
+
+      - name: Post Summary
+        run: |
+          ACTION="${{ steps.action.outputs.action }}"
+          
+          {
+            if [ "$ACTION" == "destroy" ]; then
+              echo "### 🗑️ Terraform Destroy for AppMod environment"
+              if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+                echo "**Trigger:** Manual workflow dispatch"
+                echo "**Requested by:** ${{ github.actor }}"
+                echo "**Reason:** ${{ inputs.destroy_reason }}"
+              else
+                echo "**Trigger:** Commit message [DESTROY]"
+                echo "**Commit:** ${{ github.event.head_commit.message }}"
+              fi
+              echo ""
+              echo "🗑️ Infrastructure has been destroyed!"
+            elif [ "${{ github.event_name }}" == "pull_request" ]; then
+              echo "### 📋 Terraform Plan for AppMod environment"
+              echo "**Trigger:** Pull Request"
+              echo "**PR:** #${{ github.event.number }}"
+              echo ""
+              echo "### ℹ️ Note"
+              echo "This is a PR - no changes will be applied automatically."
+              echo "Merge to trigger automatic deployment."
+            elif [ "$ACTION" == "plan" ]; then
+              echo "### 📋 Terraform Plan for AppMod environment"
+              echo "**Trigger:** Manual plan request"
+              echo "**Requested by:** ${{ github.actor }}"
+            elif [ "$ACTION" == "apply" ]; then
+              echo "### 🚀 Terraform Apply for AppMod environment"
+              echo "**Trigger:** Manual apply request"
+              echo "**Requested by:** ${{ github.actor }}"
+              echo ""
+              echo "### ✅ Apply Status"
+              echo "Infrastructure changes have been applied!"
+            else
+              echo "### 🚀 Terraform Plan + Apply for AppMod environment"
+              echo "**Trigger:** Push to branch"
+              echo "**Commit:** ${{ github.event.head_commit.message }}"
+              echo ""
+              if [ "${{ steps.plan.outcome }}" == "success" ]; then
+                echo "### ✅ Apply Status"
+                echo "Infrastructure changes have been automatically applied!"
+              else
+                echo "### ❌ Apply Status"
+                echo "Plan failed - no changes applied."
+              fi
+            fi
+            echo ""
+            echo "### 🗑️ To Destroy Infrastructure"
+            echo "Use the **Run workflow** button above and select **destroy** action, or commit with **[DESTROY]** in the message."
+          } >> "${GITHUB_STEP_SUMMARY}"
